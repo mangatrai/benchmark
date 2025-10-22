@@ -1,0 +1,6 @@
+astrapy>=0.7.0
+python-dotenv>=1.0.0
+numpy>=1.24.0
+faker>=20.0.0
+langchain-core>=0.1.0
+cassandra-driver>=3.29.0
