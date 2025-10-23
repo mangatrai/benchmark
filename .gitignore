@@ -1,3 +1,5 @@
 .env
 db/Cuda-token.json
 db/secure-connect-sample-pricing-db.zip
+*data*
+hcd/cassandra.yaml

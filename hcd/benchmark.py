@@ -149,9 +149,8 @@ class TableAPIBenchmark:
         # CSV progress tracking
         self.csv_writer = ThreadSafeCSVWriter('progress.csv')
         
-        # Dual queues for vector and data batches
-        self.vector_queue = queue.Queue(maxsize=config.queue_size)
-        self.data_queue = queue.Queue(maxsize=config.queue_size)
+        # Single queue for paired document batches
+        self.document_queue = queue.Queue(maxsize=config.queue_size)
         self.stop_event = threading.Event()
         
         # Chunk file for verification
@@ -305,9 +304,8 @@ class TableAPIBenchmark:
                 self.total_bytes_utf16le.add(batch_utf16le_bytes)
                 self.total_bytes_utf16_bom.add(batch_utf16_bom_bytes)
                 
-                # Add both batches to respective queues
-                self.vector_queue.put(vector_batch)
-                self.data_queue.put(data_batch)
+                # Add paired batches to single queue atomically
+                self.document_queue.put((vector_batch, data_batch))
                 documents_generated += len(vector_batch)  # Both batches have same length
                 
                 # Update stats
@@ -345,9 +343,8 @@ class TableAPIBenchmark:
         try:
             while not self.stop_event.is_set():
                 try:
-                    # Get batches from both queues with timeout
-                    vector_batch = self.vector_queue.get(timeout=1.0)
-                    data_batch = self.data_queue.get(timeout=1.0)
+                    # Get paired batches from single queue with timeout
+                    vector_batch, data_batch = self.document_queue.get(timeout=1.0)
                     
                     # Insert both batches into respective databases
                     self.dual_cql_client.insert_batch(vector_batch, data_batch)
@@ -371,9 +368,8 @@ class TableAPIBenchmark:
                     if documents_inserted % 1000 == 0:
                         logger.info(f"Insert worker {worker_id} inserted {documents_inserted} documents")
                     
-                    # Mark tasks as done for both queues
-                    self.vector_queue.task_done()
-                    self.data_queue.task_done()
+                    # Mark task as done for single queue
+                    self.document_queue.task_done()
                     
                 except queue.Empty:
                     # Check if we should stop
@@ -388,9 +384,8 @@ class TableAPIBenchmark:
                         # Write error checkpoint immediately
                         self._write_checkpoint("ERROR", str(e))
                     # Don't break - continue processing other batches
-                    # Mark tasks as done even if they failed
-                    self.vector_queue.task_done()
-                    self.data_queue.task_done()
+                    # Mark task as done even if it failed
+                    self.document_queue.task_done()
                     continue
         
         except Exception as e:
@@ -422,7 +417,8 @@ class TableAPIBenchmark:
                 vector_config=self.config.get_vector_db_credentials(),
                 data_config=self.config.get_data_db_credentials(),
                 max_retries=self.config.max_retries,
-                retry_delay=self.config.retry_delay
+                retry_delay=self.config.retry_delay,
+                write_consistency=self.config.write_consistency
             )
             
             # Connect to both databases
@@ -462,7 +458,7 @@ class TableAPIBenchmark:
                 thread.join()
             
             # Wait for both queues to be empty before signaling stop
-            while not self.vector_queue.empty() or not self.data_queue.empty():
+            while not self.document_queue.empty():
                 time.sleep(0.1)
             
             # Signal insert workers that no more documents will be generated

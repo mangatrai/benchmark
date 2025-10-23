@@ -12,3 +12,5 @@ WITH REPLICATION = {
 
 
 CREATE KEYSPACE price_vector WITH replication = {'class': 'NetworkTopologyStrategy', 'dc348': '3'}  AND durable_writes = true;
+
+CREATE KEYSPACE price_data WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1};

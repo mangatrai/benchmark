@@ -17,7 +17,8 @@ class DualCQLClient:
     """Client for dual database operations using traditional Cassandra CQL."""
     
     def __init__(self, vector_config: dict, data_config: dict, 
-                 max_retries: int = 3, retry_delay: float = 1.0):
+                 max_retries: int = 3, retry_delay: float = 1.0, 
+                 write_consistency: str = 'LOCAL_QUORUM'):
         """Initialize dual CQL client.
         
         Args:
@@ -25,11 +26,13 @@ class DualCQLClient:
             data_config: Configuration for data database
             max_retries: Maximum number of retry attempts
             retry_delay: Delay between retries in seconds
+            write_consistency: Write consistency level (e.g., 'ANY', 'LOCAL_QUORUM', 'QUORUM')
         """
         self.vector_config = vector_config
         self.data_config = data_config
         self.max_retries = max_retries
         self.retry_delay = retry_delay
+        self.write_consistency = write_consistency
         
         # Vector database connection
         self.vector_cluster = None
@@ -122,6 +125,10 @@ class DualCQLClient:
             if v_doc['id'] != d_doc['id']:
                 raise ValueError(f"UUID mismatch at index {i}: vector={v_doc['id']}, data={d_doc['id']}")
         
+        # If only one document, use individual insert for better performance
+        if len(vector_batch) == 1:
+            return self._insert_single_document_pair(vector_batch[0], data_batch[0])
+        
         last_vector_exception = None
         last_data_exception = None
         
@@ -157,7 +164,7 @@ class DualCQLClient:
         """Insert vector batch using CQL."""
         try:
             # Create batch statement for vector table
-            batch = BatchStatement(consistency_level=ConsistencyLevel.LOCAL_QUORUM)
+            batch = BatchStatement(consistency_level=getattr(ConsistencyLevel, self.write_consistency))
             
             for doc in vector_batch:
                 # Prepare vector insert statement
@@ -180,7 +187,7 @@ class DualCQLClient:
         """Insert data batch using CQL."""
         try:
             # Create batch statement for data table
-            batch = BatchStatement(consistency_level=ConsistencyLevel.LOCAL_QUORUM)
+            batch = BatchStatement(consistency_level=getattr(ConsistencyLevel, self.write_consistency))
             
             for doc in data_batch:
                 # Prepare data insert statement with all fields
@@ -268,3 +275,129 @@ class DualCQLClient:
             'data_table': self.data_config['table'],
             'data_host': self.data_config['host']
         }
+    
+    def _insert_single_document_pair(self, vector_doc: Dict[str, Any], data_doc: Dict[str, Any]) -> Tuple[Any, Any]:
+        """Insert a single document pair using direct CQL execution for better performance.
+        
+        Args:
+            vector_doc: Single vector document (id + vector_column)
+            data_doc: Single data document (id + chunk + metadata)
+            
+        Returns:
+            Tuple of (vector_result, data_result) from insert operations
+            
+        Raises:
+            Exception: If insertion fails for either table
+        """
+        try:
+            # Insert vector document
+            vector_result = self._insert_single_vector_document(vector_doc)
+            
+            # Insert data document
+            data_result = self._insert_single_data_document(data_doc)
+            
+            logger.debug("Successfully inserted single document pair into both tables")
+            return vector_result, data_result
+            
+        except Exception as e:
+            logger.error(f"Failed to insert single document pair: {e}")
+            raise
+    
+    def _insert_single_vector_document(self, vector_doc: Dict[str, Any]) -> Any:
+        """Insert a single vector document using direct CQL execution.
+        
+        Args:
+            vector_doc: Single vector document (id + vector_column)
+            
+        Returns:
+            Result from the insert operation
+        """
+        try:
+            # Prepare vector insert statement
+            vector_insert_cql = f"INSERT INTO {self.vector_config['table']} (id, vector_column) VALUES (?, ?)"
+            prepared_stmt = self.vector_session.prepare(vector_insert_cql)
+            
+            # Execute single insert with configurable consistency
+            result = self.vector_session.execute(
+                prepared_stmt, 
+                [vector_doc['id'], vector_doc['vector_column']],
+                consistency_level=getattr(ConsistencyLevel, self.write_consistency)
+            )
+            logger.debug("Successfully inserted single vector document via CQL")
+            return result
+            
+        except Exception as e:
+            logger.error(f"Failed to insert single vector document: {e}")
+            raise
+    
+    def _insert_single_data_document(self, data_doc: Dict[str, Any]) -> Any:
+        """Insert a single data document using direct CQL execution.
+        
+        Args:
+            data_doc: Single data document (id + chunk + metadata)
+            
+        Returns:
+            Result from the insert operation
+        """
+        try:
+            # Build the INSERT statement dynamically
+            columns = [
+                'id', 'chunk',
+                'meta_str_01', 'meta_str_02', 'meta_str_03', 'meta_str_04', 'meta_str_05',
+                'meta_str_06', 'meta_str_07', 'meta_str_08', 'meta_str_09', 'meta_str_10',
+                'meta_str_11', 'meta_str_12', 'meta_str_13', 'meta_str_14', 'meta_str_15',
+                'meta_str_16', 'meta_str_17', 'meta_str_18', 'meta_str_19', 'meta_str_20',
+                'meta_num_01', 'meta_num_02', 'meta_num_03', 'meta_num_04', 'meta_num_05',
+                'meta_num_06', 'meta_num_07', 'meta_num_08', 'meta_num_09', 'meta_num_10',
+                'meta_num_11', 'meta_num_12', 'meta_num_13', 'meta_num_14', 'meta_num_15',
+                'meta_num_16', 'meta_num_17', 'meta_num_18', 'meta_num_19', 'meta_num_20',
+                'meta_bool_01', 'meta_bool_02', 'meta_bool_03', 'meta_bool_04', 'meta_bool_05',
+                'meta_bool_06', 'meta_bool_07', 'meta_bool_08', 'meta_bool_09', 'meta_bool_10',
+                'meta_bool_11', 'meta_bool_12',
+                'meta_date_01', 'meta_date_02', 'meta_date_03', 'meta_date_04', 'meta_date_05',
+                'meta_date_06', 'meta_date_07', 'meta_date_08', 'meta_date_09', 'meta_date_10',
+                'meta_date_11', 'meta_date_12',
+                'created_at', 'updated_at'
+            ]
+            
+            # Build placeholders and column list
+            placeholders = ', '.join(['?' for _ in columns])
+            column_list = ', '.join(columns)
+            
+            # Create INSERT statement
+            data_insert_cql = f"INSERT INTO {self.data_config['table']} ({column_list}) VALUES ({placeholders})"
+            prepared_stmt = self.data_session.prepare(data_insert_cql)
+            
+            # Build values list
+            values = [
+                data_doc.get('id'),
+                data_doc.get('chunk'),
+                data_doc.get('meta_str_01'), data_doc.get('meta_str_02'), data_doc.get('meta_str_03'), data_doc.get('meta_str_04'), data_doc.get('meta_str_05'),
+                data_doc.get('meta_str_06'), data_doc.get('meta_str_07'), data_doc.get('meta_str_08'), data_doc.get('meta_str_09'), data_doc.get('meta_str_10'),
+                data_doc.get('meta_str_11'), data_doc.get('meta_str_12'), data_doc.get('meta_str_13'), data_doc.get('meta_str_14'), data_doc.get('meta_str_15'),
+                data_doc.get('meta_str_16'), data_doc.get('meta_str_17'), data_doc.get('meta_str_18'), data_doc.get('meta_str_19'), data_doc.get('meta_str_20'),
+                data_doc.get('meta_num_01'), data_doc.get('meta_num_02'), data_doc.get('meta_num_03'), data_doc.get('meta_num_04'), data_doc.get('meta_num_05'),
+                data_doc.get('meta_num_06'), data_doc.get('meta_num_07'), data_doc.get('meta_num_08'), data_doc.get('meta_num_09'), data_doc.get('meta_num_10'),
+                data_doc.get('meta_num_11'), data_doc.get('meta_num_12'), data_doc.get('meta_num_13'), data_doc.get('meta_num_14'), data_doc.get('meta_num_15'),
+                data_doc.get('meta_num_16'), data_doc.get('meta_num_17'), data_doc.get('meta_num_18'), data_doc.get('meta_num_19'), data_doc.get('meta_num_20'),
+                data_doc.get('meta_bool_01'), data_doc.get('meta_bool_02'), data_doc.get('meta_bool_03'), data_doc.get('meta_bool_04'), data_doc.get('meta_bool_05'),
+                data_doc.get('meta_bool_06'), data_doc.get('meta_bool_07'), data_doc.get('meta_bool_08'), data_doc.get('meta_bool_09'), data_doc.get('meta_bool_10'),
+                data_doc.get('meta_bool_11'), data_doc.get('meta_bool_12'),
+                data_doc.get('meta_date_01'), data_doc.get('meta_date_02'), data_doc.get('meta_date_03'), data_doc.get('meta_date_04'), data_doc.get('meta_date_05'),
+                data_doc.get('meta_date_06'), data_doc.get('meta_date_07'), data_doc.get('meta_date_08'), data_doc.get('meta_date_09'), data_doc.get('meta_date_10'),
+                data_doc.get('meta_date_11'), data_doc.get('meta_date_12'),
+                data_doc.get('created_at'), data_doc.get('updated_at')
+            ]
+            
+            # Execute single insert with configurable consistency
+            result = self.data_session.execute(
+                prepared_stmt, 
+                values,
+                consistency_level=getattr(ConsistencyLevel, self.write_consistency)
+            )
+            logger.debug("Successfully inserted single data document via CQL")
+            return result
+            
+        except Exception as e:
+            logger.error(f"Failed to insert single data document: {e}")
+            raise

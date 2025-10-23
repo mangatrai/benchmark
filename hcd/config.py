@@ -63,6 +63,9 @@ class Config:
         # Progress Tracking Configuration
         self.checkpoint_interval = int(os.getenv('CHECKPOINT_INTERVAL', '10000'))
         
+        # Write Consistency Configuration
+        self.write_consistency = os.getenv('WRITE_CONSISTENCY', 'LOCAL_QUORUM')
+        
         # Validate configuration
         self._validate_config()
         
