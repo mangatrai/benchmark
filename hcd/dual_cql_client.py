@@ -8,7 +8,7 @@ import logging
 from typing import List, Dict, Any, Optional, Tuple
 from cassandra.cluster import Cluster, ExecutionProfile, EXEC_PROFILE_DEFAULT, ProtocolVersion
 from cassandra.auth import PlainTextAuthProvider
-from cassandra.query import BatchStatement, ConsistencyLevel
+from cassandra.query import BatchStatement, ConsistencyLevel, BatchType
 
 logger = logging.getLogger(__name__)
 
@@ -42,9 +42,15 @@ class DualCQLClient:
         self.data_cluster = None
         self.data_session = None
         
+        # Prepared statements (initialized after connection)
+        self._ps_insert_vector = None
+        self._ps_insert_data = None
+        
         logger.info(f"DualCQLClient initialized:")
         logger.info(f"  - Vector DB: {vector_config['host']} -> {vector_config['keyspace']}.{vector_config['table']}")
         logger.info(f"  - Data DB: {data_config['host']} -> {data_config['keyspace']}.{data_config['table']}")
+        logger.info(f"  - Retry config: max_retries={self.max_retries}, delay={self.retry_delay}s")
+        logger.info(f"  - Consistency level: {self.write_consistency}")
     
     def connect(self) -> None:
         """Establish connection to both databases."""
@@ -57,8 +63,7 @@ class DualCQLClient:
             )
             self.vector_cluster = Cluster(
                 [self.vector_config['host']],
-                auth_provider=vector_auth_provider,
-                protocol_version=ProtocolVersion.V4
+                auth_provider=vector_auth_provider
             )
             self.vector_session = self.vector_cluster.connect()
             self.vector_session.set_keyspace(self.vector_config['keyspace'])
@@ -72,14 +77,16 @@ class DualCQLClient:
             )
             self.data_cluster = Cluster(
                 [self.data_config['host']],
-                auth_provider=data_auth_provider,
-                protocol_version=ProtocolVersion.V4
+                auth_provider=data_auth_provider
             )
             self.data_session = self.data_cluster.connect()
             self.data_session.set_keyspace(self.data_config['keyspace'])
             logger.info(f"Connected to data database: {self.data_config['keyspace']}.{self.data_config['table']}")
             
             logger.info("Successfully connected to both databases")
+            
+            # Prepare statements once after connection
+            self._prepare_statements()
             
         except Exception as e:
             logger.error(f"Failed to connect to databases: {e}")
@@ -100,6 +107,50 @@ class DualCQLClient:
                 
         except Exception as e:
             logger.error(f"Error during disconnect: {e}")
+    
+    def _prepare_statements(self) -> None:
+        """Prepare statements once after connection."""
+        try:
+            # Prepare vector insert statement
+            vector_insert_cql = f"INSERT INTO {self.vector_config['table']} (id, vector_column) VALUES (?, ?)"
+            self._ps_insert_vector = self.vector_session.prepare(vector_insert_cql)
+            
+            # Prepare data insert statement
+            columns = [
+                'id', 'chunk',
+                'meta_str_01', 'meta_str_02', 'meta_str_03', 'meta_str_04', 'meta_str_05',
+                'meta_str_06', 'meta_str_07', 'meta_str_08', 'meta_str_09', 'meta_str_10',
+                'meta_str_11', 'meta_str_12', 'meta_str_13', 'meta_str_14', 'meta_str_15',
+                'meta_str_16', 'meta_str_17', 'meta_str_18', 'meta_str_19', 'meta_str_20',
+                'meta_num_01', 'meta_num_02', 'meta_num_03', 'meta_num_04', 'meta_num_05',
+                'meta_num_06', 'meta_num_07', 'meta_num_08', 'meta_num_09', 'meta_num_10',
+                'meta_num_11', 'meta_num_12', 'meta_num_13', 'meta_num_14', 'meta_num_15',
+                'meta_num_16', 'meta_num_17', 'meta_num_18', 'meta_num_19', 'meta_num_20',
+                'meta_bool_01', 'meta_bool_02', 'meta_bool_03', 'meta_bool_04', 'meta_bool_05',
+                'meta_bool_06', 'meta_bool_07', 'meta_bool_08', 'meta_bool_09', 'meta_bool_10',
+                'meta_bool_11', 'meta_bool_12',
+                'meta_date_01', 'meta_date_02', 'meta_date_03', 'meta_date_04', 'meta_date_05',
+                'meta_date_06', 'meta_date_07', 'meta_date_08', 'meta_date_09', 'meta_date_10',
+                'meta_date_11', 'meta_date_12',
+                'created_at', 'updated_at'
+            ]
+            placeholders = ', '.join(['?' for _ in columns])
+            column_list = ', '.join(columns)
+            data_insert_cql = f"INSERT INTO {self.data_config['table']} ({column_list}) VALUES ({placeholders})"
+            self._ps_insert_data = self.data_session.prepare(data_insert_cql)
+            
+            logger.debug("Prepared statements initialized")
+            
+        except Exception as e:
+            logger.error(f"Failed to prepare statements: {e}")
+            raise
+    
+    def _cl(self):
+        """Get normalized consistency level with error handling."""
+        try:
+            return getattr(ConsistencyLevel, str(self.write_consistency).upper())
+        except AttributeError:
+            raise ValueError(f"Invalid consistency level: {self.write_consistency}")
     
     def insert_batch(self, vector_batch: List[Dict[str, Any]], data_batch: List[Dict[str, Any]]) -> Tuple[Any, Any]:
         """Insert batches into both tables with same UUID correlation.
@@ -129,50 +180,59 @@ class DualCQLClient:
         if len(vector_batch) == 1:
             return self._insert_single_document_pair(vector_batch[0], data_batch[0])
         
-        last_vector_exception = None
-        last_data_exception = None
+        # Independent retry logic for each table
+        vec_ok = dat_ok = False
+        vec_exc = dat_exc = None
+        vector_result = None
+        data_result = None
         
-        # Retry logic for both insertions
+        # Retry vector table independently
         for attempt in range(self.max_retries + 1):
             try:
-                logger.debug(f"Inserting batch of {len(vector_batch)} documents (attempt {attempt + 1})")
-                
-                # Insert into vector table
+                logger.debug(f"Inserting vector batch of {len(vector_batch)} documents (attempt {attempt + 1})")
+                logger.info(f"Vector batch size: {len(vector_batch)} documents")
                 vector_result = self._insert_vector_batch(vector_batch)
-                
-                # Insert into data table
-                data_result = self._insert_data_batch(data_batch)
-                
-                logger.debug(f"Successfully inserted {len(vector_batch)} documents into both tables")
-                return vector_result, data_result
-                
+                vec_ok = True
+                break
             except Exception as e:
-                last_vector_exception = e
-                last_data_exception = e  # Same error for both
-                logger.warning(f"Insert attempt {attempt + 1} failed: {e}")
-                
+                vec_exc = e
+                logger.warning(f"Vector insert attempt {attempt + 1} failed: {e}")
                 if attempt < self.max_retries:
-                    logger.info(f"Retrying in {self.retry_delay} seconds...")
+                    logger.info(f"Retrying vector insert in {self.retry_delay} seconds...")
                     time.sleep(self.retry_delay)
-                else:
-                    logger.error(f"All {self.max_retries + 1} insert attempts failed")
         
-        # If we get here, all retries failed
-        raise Exception(f"Vector insertion failed: {last_vector_exception}, Data insertion failed: {last_data_exception}")
+        # Retry data table independently
+        for attempt in range(self.max_retries + 1):
+            try:
+                logger.debug(f"Inserting data batch of {len(data_batch)} documents (attempt {attempt + 1})")
+                logger.info(f"Data batch size: {len(data_batch)} documents")
+                data_result = self._insert_data_batch(data_batch)
+                dat_ok = True
+                break
+            except Exception as e:
+                dat_exc = e
+                logger.warning(f"Data insert attempt {attempt + 1} failed: {e}")
+                if attempt < self.max_retries:
+                    logger.info(f"Retrying data insert in {self.retry_delay} seconds...")
+                    time.sleep(self.retry_delay)
+        
+        # Report results
+        if not vec_ok or not dat_ok:
+            raise Exception(f"vector_ok={vec_ok}, data_ok={dat_ok}, "
+                           f"vector_err={vec_exc}, data_err={dat_exc}")
+        
+        logger.debug(f"Successfully inserted {len(vector_batch)} documents into both tables")
+        return vector_result, data_result
     
     def _insert_vector_batch(self, vector_batch: List[Dict[str, Any]]) -> Any:
         """Insert vector batch using CQL."""
         try:
             # Create batch statement for vector table
-            batch = BatchStatement(consistency_level=getattr(ConsistencyLevel, self.write_consistency))
+            batch = BatchStatement(batch_type=BatchType.UNLOGGED, consistency_level=self._cl())
             
             for doc in vector_batch:
-                # Prepare vector insert statement
-                vector_insert_cql = f"INSERT INTO {self.vector_config['table']} (id, vector_column) VALUES (?, ?)"
-                prepared_stmt = self.vector_session.prepare(vector_insert_cql)
-                
-                # Add to batch
-                batch.add(prepared_stmt, [doc['id'], doc['vector_column']])
+                # Add to batch using prepared statement
+                batch.add(self._ps_insert_vector, [doc['id'], doc['vector_column']])
             
             # Execute batch
             result = self.vector_session.execute(batch)
@@ -187,37 +247,9 @@ class DualCQLClient:
         """Insert data batch using CQL."""
         try:
             # Create batch statement for data table
-            batch = BatchStatement(consistency_level=getattr(ConsistencyLevel, self.write_consistency))
+            batch = BatchStatement(batch_type=BatchType.UNLOGGED, consistency_level=self._cl())
             
             for doc in data_batch:
-                # Prepare data insert statement with all fields
-                columns = [
-                    'id', 'chunk',
-                    'meta_str_01', 'meta_str_02', 'meta_str_03', 'meta_str_04', 'meta_str_05',
-                    'meta_str_06', 'meta_str_07', 'meta_str_08', 'meta_str_09', 'meta_str_10',
-                    'meta_str_11', 'meta_str_12', 'meta_str_13', 'meta_str_14', 'meta_str_15',
-                    'meta_str_16', 'meta_str_17', 'meta_str_18', 'meta_str_19', 'meta_str_20',
-                    'meta_num_01', 'meta_num_02', 'meta_num_03', 'meta_num_04', 'meta_num_05',
-                    'meta_num_06', 'meta_num_07', 'meta_num_08', 'meta_num_09', 'meta_num_10',
-                    'meta_num_11', 'meta_num_12', 'meta_num_13', 'meta_num_14', 'meta_num_15',
-                    'meta_num_16', 'meta_num_17', 'meta_num_18', 'meta_num_19', 'meta_num_20',
-                    'meta_bool_01', 'meta_bool_02', 'meta_bool_03', 'meta_bool_04', 'meta_bool_05',
-                    'meta_bool_06', 'meta_bool_07', 'meta_bool_08', 'meta_bool_09', 'meta_bool_10',
-                    'meta_bool_11', 'meta_bool_12',
-                    'meta_date_01', 'meta_date_02', 'meta_date_03', 'meta_date_04', 'meta_date_05',
-                    'meta_date_06', 'meta_date_07', 'meta_date_08', 'meta_date_09', 'meta_date_10',
-                    'meta_date_11', 'meta_date_12',
-                    'created_at', 'updated_at'
-                ]
-                
-                # Build placeholders and column list
-                placeholders = ', '.join(['?' for _ in columns])
-                column_list = ', '.join(columns)
-                
-                # Create INSERT statement
-                data_insert_cql = f"INSERT INTO {self.data_config['table']} ({column_list}) VALUES ({placeholders})"
-                prepared_stmt = self.data_session.prepare(data_insert_cql)
-                
                 # Build values list
                 values = [
                     doc.get('id'),
@@ -239,8 +271,8 @@ class DualCQLClient:
                     doc.get('created_at'), doc.get('updated_at')
                 ]
                 
-                # Add to batch
-                batch.add(prepared_stmt, values)
+                # Add to batch using prepared statement
+                batch.add(self._ps_insert_data, values)
             
             # Execute batch
             result = self.data_session.execute(batch)
@@ -313,15 +345,10 @@ class DualCQLClient:
             Result from the insert operation
         """
         try:
-            # Prepare vector insert statement
-            vector_insert_cql = f"INSERT INTO {self.vector_config['table']} (id, vector_column) VALUES (?, ?)"
-            prepared_stmt = self.vector_session.prepare(vector_insert_cql)
-            
-            # Execute single insert with configurable consistency
-            result = self.vector_session.execute(
-                prepared_stmt.bind([vector_doc['id'], vector_doc['vector_column']]),
-                consistency_level=getattr(ConsistencyLevel, self.write_consistency)
-            )
+            # Execute single insert with configurable consistency using prepared statement
+            bound = self._ps_insert_vector.bind([vector_doc['id'], vector_doc['vector_column']])
+            bound.consistency_level = self._cl()
+            result = self.vector_session.execute(bound)
             logger.debug("Successfully inserted single vector document via CQL")
             return result
             
@@ -339,34 +366,6 @@ class DualCQLClient:
             Result from the insert operation
         """
         try:
-            # Build the INSERT statement dynamically
-            columns = [
-                'id', 'chunk',
-                'meta_str_01', 'meta_str_02', 'meta_str_03', 'meta_str_04', 'meta_str_05',
-                'meta_str_06', 'meta_str_07', 'meta_str_08', 'meta_str_09', 'meta_str_10',
-                'meta_str_11', 'meta_str_12', 'meta_str_13', 'meta_str_14', 'meta_str_15',
-                'meta_str_16', 'meta_str_17', 'meta_str_18', 'meta_str_19', 'meta_str_20',
-                'meta_num_01', 'meta_num_02', 'meta_num_03', 'meta_num_04', 'meta_num_05',
-                'meta_num_06', 'meta_num_07', 'meta_num_08', 'meta_num_09', 'meta_num_10',
-                'meta_num_11', 'meta_num_12', 'meta_num_13', 'meta_num_14', 'meta_num_15',
-                'meta_num_16', 'meta_num_17', 'meta_num_18', 'meta_num_19', 'meta_num_20',
-                'meta_bool_01', 'meta_bool_02', 'meta_bool_03', 'meta_bool_04', 'meta_bool_05',
-                'meta_bool_06', 'meta_bool_07', 'meta_bool_08', 'meta_bool_09', 'meta_bool_10',
-                'meta_bool_11', 'meta_bool_12',
-                'meta_date_01', 'meta_date_02', 'meta_date_03', 'meta_date_04', 'meta_date_05',
-                'meta_date_06', 'meta_date_07', 'meta_date_08', 'meta_date_09', 'meta_date_10',
-                'meta_date_11', 'meta_date_12',
-                'created_at', 'updated_at'
-            ]
-            
-            # Build placeholders and column list
-            placeholders = ', '.join(['?' for _ in columns])
-            column_list = ', '.join(columns)
-            
-            # Create INSERT statement
-            data_insert_cql = f"INSERT INTO {self.data_config['table']} ({column_list}) VALUES ({placeholders})"
-            prepared_stmt = self.data_session.prepare(data_insert_cql)
-            
             # Build values list
             values = [
                 data_doc.get('id'),
@@ -388,11 +387,10 @@ class DualCQLClient:
                 data_doc.get('created_at'), data_doc.get('updated_at')
             ]
             
-            # Execute single insert with configurable consistency
-            result = self.data_session.execute(
-                prepared_stmt.bind(values),
-                consistency_level=getattr(ConsistencyLevel, self.write_consistency)
-            )
+            # Execute single insert with configurable consistency using prepared statement
+            bound = self._ps_insert_data.bind(values)
+            bound.consistency_level = self._cl()
+            result = self.data_session.execute(bound)
             logger.debug("Successfully inserted single data document via CQL")
             return result
             
