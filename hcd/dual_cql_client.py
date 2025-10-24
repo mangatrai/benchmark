@@ -319,8 +319,7 @@ class DualCQLClient:
             
             # Execute single insert with configurable consistency
             result = self.vector_session.execute(
-                prepared_stmt, 
-                [vector_doc['id'], vector_doc['vector_column']],
+                prepared_stmt.bind([vector_doc['id'], vector_doc['vector_column']]),
                 consistency_level=getattr(ConsistencyLevel, self.write_consistency)
             )
             logger.debug("Successfully inserted single vector document via CQL")
@@ -391,8 +390,7 @@ class DualCQLClient:
             
             # Execute single insert with configurable consistency
             result = self.data_session.execute(
-                prepared_stmt, 
-                values,
+                prepared_stmt.bind(values),
                 consistency_level=getattr(ConsistencyLevel, self.write_consistency)
             )
             logger.debug("Successfully inserted single data document via CQL")
