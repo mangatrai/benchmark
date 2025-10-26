@@ -66,6 +66,10 @@ class Config:
         # Write Consistency Configuration
         self.write_consistency = os.getenv('WRITE_CONSISTENCY', 'LOCAL_QUORUM')
         
+        # Chunk File Configuration
+        self.chunk_file_enabled = os.getenv('CHUNK_FILE_ENABLED', 'false').lower() == 'true'
+        self.chunk_file_directory = os.getenv('CHUNK_FILE_DIRECTORY', 'data')
+        
         # Validate configuration
         self._validate_config()
         
@@ -77,6 +81,8 @@ class Config:
         logger.info(f"  - Vector DB: {self.vector_db_host}:{self.vector_db_keyspace}.{self.vector_db_table}")
         logger.info(f"  - Data DB: {self.data_db_host}:{self.data_db_keyspace}.{self.data_db_table}")
         logger.info(f"  - Checkpoint interval: {self.checkpoint_interval}")
+        logger.info(f"  - Chunk file enabled: {self.chunk_file_enabled}")
+        logger.info(f"  - Chunk file directory: {self.chunk_file_directory}")
     
     def _validate_config(self) -> None:
         """Validate required configuration values."""

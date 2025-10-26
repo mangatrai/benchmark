@@ -207,10 +207,14 @@ class TableAPIBenchmark:
     
     def setup_chunk_file(self) -> None:
         """Setup chunk file for verification."""
+        if not self.config.chunk_file_enabled:
+            logger.info("Chunk file writing disabled")
+            return
+        
         try:
-            os.makedirs("data", exist_ok=True)
+            os.makedirs(self.config.chunk_file_directory, exist_ok=True)
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            self.chunk_file_path = f"data/chunks_{timestamp}.txt"
+            self.chunk_file_path = f"{self.config.chunk_file_directory}/chunks_{timestamp}.txt"
             self.chunk_file_handle = open(self.chunk_file_path, 'w', encoding='utf-8')
             logger.info(f"Chunk file created: {self.chunk_file_path}")
         except Exception as e:
@@ -220,7 +224,7 @@ class TableAPIBenchmark:
     
     def write_chunk_to_file(self, chunk: str):
         """Write chunk to file for verification."""
-        if self.chunk_file_handle:
+        if self.chunk_file_handle and self.config.chunk_file_enabled:
             with self.chunk_file_lock:
                 self.chunk_file_handle.write(chunk)
                 self.chunk_file_handle.flush()

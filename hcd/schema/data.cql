@@ -2,7 +2,7 @@
 -- Table: sample_price_50 with balanced metadata fields
 
 -- Main table for data documents
-CREATE TABLE IF NOT EXISTS price_data.price_data_50 (
+CREATE TABLE IF NOT EXISTS price_data.price_data_100 (
     -- Primary key
     id UUID PRIMARY KEY,
     
@@ -86,7 +86,7 @@ CREATE TABLE IF NOT EXISTS price_data.price_data_50 (
     updated_at TIMESTAMP
 ) WITH compaction = {
     'class': 'org.apache.cassandra.db.compaction.UnifiedCompactionStrategy',
-    'num_shards': '16',
+    'num_shards': '32',
     'static_scaling_factors': '2,-8',
     'min_sstable_size_in_mb': '100',
     'max_space_overhead': '0.20'
